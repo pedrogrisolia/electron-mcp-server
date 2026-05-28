@@ -21,6 +21,7 @@ export interface ElectronProcess {
   startTime: Date;
   appPath: string;
   cdpClient?: any; // Cliente do Chrome DevTools Protocol
+  cdpTargetId?: string; // Alvo CDP atualmente conectado
   targets?: CDPTarget[]; // Alvos de depuração disponíveis
   lastTargetUpdate?: Date; // Quando os alvos foram atualizados pela última vez
   screenshots?: string[]; // Caminhos de screenshots armazenados

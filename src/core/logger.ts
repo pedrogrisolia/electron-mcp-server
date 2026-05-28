@@ -18,15 +18,15 @@ class Logger {
   }
 
   private log(level: LogLevel, message: string, ...args: any[]) {
+    if (process.env.MCP_LOG_LEVEL === 'silent') return;
     const timestamp = new Date().toISOString();
     const formattedMessage = `[${timestamp}] [${level.toUpperCase()}] ${message}`;
-    
-    const logMethod = console[level] || console.log;
-    
+    // MCP stdio transport uses stdout for JSON-RPC only — always log to stderr.
+    const logFn = level === 'error' || level === 'warn' ? console.error : console.error;
     if (args.length > 0) {
-      logMethod(formattedMessage, ...args);
+      logFn(formattedMessage, ...args);
     } else {
-      logMethod(formattedMessage);
+      logFn(formattedMessage);
     }
   }
 

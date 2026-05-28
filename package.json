@@ -5,17 +5,25 @@
   "scripts": {
     "build": "tsc",
     "start": "node build/index.js",
+    "start:http": "node build/index.js --http --port=3000",
     "dev": "tsc && node build/index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test:mcp": "node scripts/test-mcp-tools.mjs",
+    "test": "npm run build && npm run test:mcp"
   },
-  "keywords": ["electron", "debug", "mcp", "model-context-protocol"],
+  "keywords": [
+    "electron",
+    "debug",
+    "mcp",
+    "model-context-protocol"
+  ],
   "author": "",
   "license": "ISC",
   "description": "An MCP server for Electron debugging",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.1.0",
-    "electron": "^29.1.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "express": "^5.1.0",
     "chrome-remote-interface": "^0.33.0",
+    "electron": "^29.1.0",
     "ws": "^8.16.0"
   },
   "devDependencies": {

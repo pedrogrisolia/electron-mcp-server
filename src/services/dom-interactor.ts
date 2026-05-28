@@ -4,6 +4,82 @@ import { ElectronProcess, TestResult } from '../types/index.js';
 import { executeCDPCommand } from './cdp-client.js';
 import { logger } from '../core/logger.js';
 
+/** Safe CSS selector literal for embedding in Runtime.evaluate scripts. */
+function jsSelector(selector: string): string {
+  return JSON.stringify(selector);
+}
+
+/** Wraps script body in an IIFE so top-level `return` is valid in Runtime.evaluate. */
+function wrapDomScript(body: string): string {
+  return `(function() { ${body} })();`;
+}
+
+function getEvaluateReturnValue(testResult: TestResult): unknown {
+  const value = testResult.details?.result?.value;
+  if (value === undefined || value === null) return value;
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value;
+    }
+  }
+  return value;
+}
+
+async function runDomScript(
+  electronProcess: ElectronProcess,
+  targetId: string,
+  body: string,
+  options: { awaitPromise?: boolean } = {}
+): Promise<TestResult> {
+  return executeScript(electronProcess, targetId, wrapDomScript(body), {
+    returnByValue: true,
+    awaitPromise: options.awaitPromise ?? false,
+  });
+}
+
+async function resolveElementCenter(
+  electronProcess: ElectronProcess,
+  targetId: string,
+  selector: string
+): Promise<{ x: number; y: number }> {
+  const sel = jsSelector(selector);
+  const evalResult = await runDomScript(
+    electronProcess,
+    targetId,
+    `
+    const element = document.querySelector(${sel});
+    if (!element) return { success: false, error: 'Element not found' };
+    element.scrollIntoView({ block: 'center', inline: 'center' });
+    const rect = element.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) {
+      return { success: false, error: 'Element has no size' };
+    }
+    return {
+      success: true,
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+    };
+    `
+  );
+
+  const payload = getEvaluateReturnValue(evalResult) as {
+    success?: boolean;
+    x?: number;
+    y?: number;
+    error?: string;
+  } | undefined;
+
+  if (!evalResult.success || !payload?.success || payload.x === undefined || payload.y === undefined) {
+    throw new Error(
+      payload?.error || `Could not resolve coordinates for selector: ${selector}`
+    );
+  }
+
+  return { x: payload.x, y: payload.y };
+}
+
 // O diretório de screenshots deve ser gerenciado de forma centralizada.
 const SCREENSHOTS_DIR = path.join(process.cwd(), 'electron-screenshots');
 if (!fs.existsSync(SCREENSHOTS_DIR)) {
@@ -229,15 +305,17 @@ export async function simulateClick(
     };
 
     try {
-        const clickExpression = `
-            (function() {
-                const element = document.querySelector('${selector}');
-                if (!element) return { success: false, error: 'Element not found' };
-                element.click();
-                return { success: true };
-            })();
-        `;
-        const clickResult = await executeScript(electronProcess, targetId, clickExpression, { awaitPromise: true });
+        const clickResult = await runDomScript(
+          electronProcess,
+          targetId,
+          `
+          const element = document.querySelector(${jsSelector(selector)});
+          if (!element) return { success: false, error: 'Element not found' };
+          element.click();
+          return { success: true };
+          `,
+          { awaitPromise: true }
+        );
 
         result.success = clickResult.success;
         result.details.clickResult = clickResult.details;
@@ -396,19 +474,7 @@ export async function getDOMTree(electronProcess: ElectronProcess, targetId: str
  * @returns Um objeto TestResult com os resultados da ação.
  */
 export async function simulateDoubleClick(electronProcess: ElectronProcess, targetId: string, selector: string): Promise<TestResult> {
-    const jsExpression = `
-        const element = document.querySelector('${selector}');
-        if (!element) throw new Error('Element not found');
-        const { x, y, width, height } = element.getBoundingClientRect();
-        if (width === 0 || height === 0) throw new Error('Element has no size');
-        // Retorna o centro do elemento
-        JSON.stringify({ x: x + width / 2, y: y + height / 2 });
-    `;
-    const evalResult = await executeScript(electronProcess, targetId, jsExpression);
-    if (!evalResult.success || !evalResult.details.result.value) {
-        throw new Error(`Could not find element or its coordinates for selector: ${selector}`);
-    }
-    const { x, y } = JSON.parse(evalResult.details.result.value);
+    const { x, y } = await resolveElementCenter(electronProcess, targetId, selector);
 
     await executeCDPCommand(electronProcess, targetId, 'Input', 'dispatchMouseEvent', {
         type: 'mousePressed', x, y, button: 'left', clickCount: 2,
@@ -421,7 +487,7 @@ export async function simulateDoubleClick(electronProcess: ElectronProcess, targ
         success: true,
         action: 'simulate_double_click',
         details: { selector, x, y },
-        timing: { startTime: 0, endTime: 0, duration: 0 } // Simplificado
+        timing: { startTime: 0, endTime: 0, duration: 0 }
     };
 }
 
@@ -434,18 +500,7 @@ export async function simulateDoubleClick(electronProcess: ElectronProcess, targ
  * @returns Um objeto TestResult com os resultados da ação.
  */
 export async function simulateHover(electronProcess: ElectronProcess, targetId: string, selector: string): Promise<TestResult> {
-    const jsExpression = `
-        const element = document.querySelector('${selector}');
-        if (!element) throw new Error('Element not found');
-        const { x, y, width, height } = element.getBoundingClientRect();
-        if (width === 0 || height === 0) throw new Error('Element has no size');
-        JSON.stringify({ x: x + width / 2, y: y + height / 2 });
-    `;
-    const evalResult = await executeScript(electronProcess, targetId, jsExpression);
-    if (!evalResult.success || !evalResult.details.result.value) {
-        throw new Error(`Could not find element for hover: ${selector}`);
-    }
-    const { x, y } = JSON.parse(evalResult.details.result.value);
+    const { x, y } = await resolveElementCenter(electronProcess, targetId, selector);
 
     await executeCDPCommand(electronProcess, targetId, 'Input', 'dispatchMouseEvent', {
         type: 'mouseMoved', x, y
@@ -468,15 +523,20 @@ export async function simulateHover(electronProcess: ElectronProcess, targetId: 
  * @returns Um objeto TestResult com os resultados da ação.
  */
 export async function submitForm(electronProcess: ElectronProcess, targetId: string, selector: string): Promise<TestResult> {
-    const expression = `
-        const form = document.querySelector('${selector}');
-        if (form && form instanceof HTMLFormElement) {
-            form.submit();
-            return { success: true };
-        }
-        return { success: false, error: 'Form element not found' };
-    `;
-    return executeScript(electronProcess, targetId, expression, { awaitPromise: true });
+    const sel = jsSelector(selector);
+    return runDomScript(
+      electronProcess,
+      targetId,
+      `
+      const form = document.querySelector(${sel});
+      if (form && form instanceof HTMLFormElement) {
+        form.requestSubmit ? form.requestSubmit() : form.submit();
+        return { success: true };
+      }
+      return { success: false, error: 'Form element not found' };
+      `,
+      { awaitPromise: true }
+    );
 }
 
 /**
@@ -496,15 +556,21 @@ export async function setElementAttribute(
     attribute: string,
     value: string
 ): Promise<TestResult> {
-    const expression = `
-        const element = document.querySelector('${selector}');
-        if (element) {
-            element.setAttribute('${attribute}', '${value}');
-            return { success: true };
-        }
-        return { success: false, error: 'Element not found' };
-    `;
-    return executeScript(electronProcess, targetId, expression);
+    const sel = jsSelector(selector);
+    const attr = JSON.stringify(attribute);
+    const val = JSON.stringify(value);
+    return runDomScript(
+      electronProcess,
+      targetId,
+      `
+      const element = document.querySelector(${sel});
+      if (element) {
+        element.setAttribute(${attr}, ${val});
+        return { success: true };
+      }
+      return { success: false, error: 'Element not found' };
+      `
+    );
 }
 
 /**
@@ -559,18 +625,20 @@ export async function interactWithDom(params: {
       return setElementAttribute(electronProcess, targetId, selector, attribute, value);
     case 'type_text':
        if (value === undefined) throw new Error('value is required for type_text action.');
-       // A lógica para 'type_text' seria implementada aqui, provavelmente usando executeScript.
-       const expression = `
-         (() => {
-           const element = document.querySelector('${selector}');
-           if (element) {
-               element.value = '${value}';
-               return { success: true };
-           }
-           return { success: false, error: 'Element not found' };
-         })();
-       `;
-       return executeScript(electronProcess, targetId, expression, { returnByValue: true });
+       return runDomScript(
+         electronProcess,
+         targetId,
+         `
+         const element = document.querySelector(${jsSelector(selector)});
+         if (element && 'value' in element) {
+           element.value = ${JSON.stringify(value)};
+           element.dispatchEvent(new Event('input', { bubbles: true }));
+           element.dispatchEvent(new Event('change', { bubbles: true }));
+           return { success: true };
+         }
+         return { success: false, error: 'Element not found or not an input' };
+         `
+       );
     default:
       throw new Error(`Invalid DOM interaction action: ${action}`);
   }

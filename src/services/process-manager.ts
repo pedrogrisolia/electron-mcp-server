@@ -9,7 +9,14 @@ import { logger } from '../core/logger.js';
 // A função updateCDPTargets será movida para o cdp-client, mas é necessária aqui por enquanto.
 // Para evitar dependência circular, vamos defini-la temporariamente.
 // No final da Fase 1, isso será limpo.
-import { updateCDPTargets } from './cdp-client.js';
+import {
+  updateCDPTargets,
+  fetchCDPTargets,
+  waitForPageTargets,
+  discoverPortsFromDevToolsActivePort,
+  isDebugPortActive,
+  executeCDPCommand,
+} from './cdp-client.js';
 
 // O estado dos processos será gerenciado aqui.
 const electronProcesses: Map<string, ElectronProcess> = new Map();
@@ -27,10 +34,11 @@ export function getElectronProcesses(): Map<string, ElectronProcess> {
  * @returns O caminho para o executável do Electron ou 'electron' se estiver no PATH.
  */
 export function getElectronExecutablePath(): string {
+  const binName = process.platform === 'win32' ? 'electron.exe' : 'electron';
   const possiblePaths = [
+    path.resolve(process.cwd(), 'node_modules', 'electron', 'dist', binName),
     path.join(os.homedir(), 'AppData', 'Roaming', 'npm', 'electron.cmd'),
-    path.resolve(process.cwd(), 'node_modules', '.bin', 'electron.cmd'),
-    // Adicionar caminhos para outros SOs se necessário
+    path.resolve(process.cwd(), 'node_modules', '.bin', process.platform === 'win32' ? 'electron.cmd' : 'electron'),
   ];
 
   for (const electronPath of possiblePaths) {
@@ -41,7 +49,7 @@ export function getElectronExecutablePath(): string {
   }
 
   logger.info('Electron executable not found in common paths, assuming it is in PATH.');
-  return 'electron';
+  return process.platform === 'win32' ? 'electron.exe' : 'electron';
 }
 
 /**
@@ -59,14 +67,16 @@ export async function startElectronApp(
   let { debugPort } = options;
 
   const id = `electron-${Date.now()}`;
-  const args = [appPath];
-  
+
   if (!debugPort) {
     debugPort = Math.floor(Math.random() * (9999 - 9222 + 1)) + 9222;
   }
-  
-  args.unshift(`--remote-debugging-port=${debugPort}`);
-  args.unshift('--enable-logging');
+
+  const args = [
+    `--remote-debugging-port=${debugPort}`,
+    '--enable-logging',
+    appPath,
+  ];
   
   const electronPath = getElectronExecutablePath();
   const electronProc = spawn(electronPath, args, {
@@ -133,16 +143,16 @@ export async function startElectronApp(
   });
   
   electronProcesses.set(id, electronProcess);
-  
-  await new Promise(resolve => setTimeout(resolve, 2000)); // Aumentado para dar mais tempo
-  
+
   try {
-    await updateCDPTargets(electronProcess);
+    const targets = await waitForPageTargets(debugPort);
+    electronProcess.targets = targets;
+    electronProcess.lastTargetUpdate = new Date();
   } catch (err) {
     logger.warn(`[Electron ${id}] Could not connect to CDP initially. The app might still be starting.`, err);
   }
-  
-  return electronProcess;
+
+  return toPublicProcess(electronProcess);
 }
 
 /**
@@ -222,29 +232,20 @@ function checkPortInUse(port: number): Promise<boolean> {
  * @returns Uma promessa que resolve com uma lista de portas ativas.
  */
 export async function scanForElectronApps(): Promise<number[]> {
-  const commonPorts = [9222, 9223, 9229]; // Portas comuns
+  const portSet = new Set<number>([9222, 9223, 9229, 9230, 9299]);
+
+  for (const { port } of await discoverPortsFromDevToolsActivePort()) {
+    portSet.add(port);
+  }
+
   const activePorts: number[] = [];
-  
-  for (const port of commonPorts) {
-    try {
-      const isActive = await checkPortInUse(port);
-      if (isActive) {
-        try {
-          const data = await httpGet(`http://localhost:${port}/json/list`);
-          const targets = JSON.parse(data);
-          if (Array.isArray(targets)) {
-            activePorts.push(port);
-            logger.info(`Found Electron debug port: ${port}`);
-          }
-        } catch (err) {
-            // não é um endpoint de debug
-        }
-      }
-    } catch (err) {
-        // erro ao checar a porta
+  for (const port of portSet) {
+    if (await isDebugPortActive(port)) {
+      activePorts.push(port);
+      logger.info(`Found Electron debug port: ${port}`);
     }
   }
-  return activePorts;
+  return activePorts.sort((a, b) => a - b);
 }
 
 /**
@@ -255,35 +256,64 @@ export async function scanForElectronApps(): Promise<number[]> {
  */
 export async function connectToExistingElectronApp(port: number): Promise<ElectronProcess> {
   try {
-    const data = await httpGet(`http://localhost:${port}/json/list`);
-    const targets = JSON.parse(data) as CDPTarget[];
-    
-    if (!Array.isArray(targets) || targets.length === 0) {
-      throw new Error('No debuggable targets found');
+    if (!(await isDebugPortActive(port))) {
+      throw new Error(
+        `No debugger listening on port ${port}. Restart the Electron app with remote debugging enabled (e.g. --remote-debugging-port=${port} or app.commandLine.appendSwitch in dev mode).`
+      );
     }
-    
+
+    const targets = await waitForPageTargets(port, 10000);
+    const pageTargets = targets.filter((t) => t.type === 'page');
+    if (pageTargets.length === 0) {
+      throw new Error(
+        `Debugger is active on port ${port} but no page targets were found. Open a BrowserWindow in the app and try again.`
+      );
+    }
+
     const id = `electron-existing-${port}`;
     const electronProcess: ElectronProcess = {
       id,
-      process: null, // Sem processo filho, pois é um app existente
+      process: null,
       name: `Existing App (Port ${port})`,
       status: 'running',
       debugPort: port,
       startTime: new Date(),
-      logBuffer: [{ type: 'console', level: 'info', message: `Connected to existing Electron app on port ${port}`, timestamp: new Date(), source: 'mcp-server' }],
+      logBuffer: [{
+        type: 'console',
+        level: 'info',
+        message: `Connected to existing Electron app on port ${port}`,
+        timestamp: new Date(),
+        source: 'mcp-server',
+      }],
       appPath: 'existing',
-      targets
+      targets,
+      lastTargetUpdate: new Date(),
     };
-    
+
     electronProcesses.set(id, electronProcess);
-    logger.info(`Connected to existing Electron app on port ${port} with ${targets.length} targets`);
-    
-    return electronProcess;
+    logger.info(
+      `Connected to existing Electron app on port ${port} with ${targets.length} targets (${pageTargets.length} pages)`
+    );
+
+    return toPublicProcess(electronProcess);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     logger.error(`Failed to connect to Electron app on port ${port}: ${errorMessage}`);
     throw new Error(`Failed to connect to Electron app on port ${port}: ${errorMessage}`);
   }
+}
+
+/** JSON-safe view of a managed Electron process (no ChildProcess handle). */
+export function toPublicProcess(process: ElectronProcess): ElectronProcess {
+  return {
+    ...process,
+    process: null,
+    startTime: process.startTime,
+    lastTargetUpdate: process.lastTargetUpdate,
+    logBuffer: process.logBuffer,
+    cdpClient: undefined,
+    cdpTargetId: undefined,
+  };
 }
 
 /**
@@ -305,7 +335,7 @@ export function terminateElectronApp(id: string): boolean {
  * @param id O ID do processo a ser recarregado.
  * @returns Uma promessa que resolve com o novo objeto ElectronProcess.
  */
-export async function reloadElectronApp(id: string): Promise<ElectronProcess> {
+export async function reloadElectronApp(id: string, targetId?: string): Promise<ElectronProcess> {
   const electronProcess = electronProcesses.get(id);
   if (!electronProcess) {
     const errorMsg = `Process with id ${id} not found for reloading.`;
@@ -316,18 +346,46 @@ export async function reloadElectronApp(id: string): Promise<ElectronProcess> {
   const { appPath, debugPort, reconnect } = electronProcess;
 
   if (appPath === 'existing' || !appPath) {
-      const errorMsg = `Cannot reload an existing app connection (Port ${debugPort}). You must restart it manually.`;
-      logger.error(errorMsg);
-      throw new Error(errorMsg);
+    await updateCDPTargets(electronProcess);
+    const pageTargets =
+      electronProcess.targets?.filter(
+        (t) =>
+          t.type === 'page' &&
+          !t.url?.startsWith('devtools://') &&
+          (!targetId || t.id === targetId)
+      ) ?? [];
+
+    if (pageTargets.length === 0) {
+      throw new Error(
+        `No reloadable page target found${targetId ? ` for targetId ${targetId}` : ''} on port ${debugPort}.`
+      );
+    }
+
+    for (const target of pageTargets) {
+      await executeCDPCommand(electronProcess, target.id, 'Page', 'reload', { ignoreCache: true });
+      logger.info(`Reloaded page target ${target.id} (${target.title}) via CDP.`);
+    }
+
+    if (electronProcess.cdpClient) {
+      const staleClient = electronProcess.cdpClient;
+      electronProcess.cdpClient = undefined;
+      electronProcess.cdpTargetId = undefined;
+      try {
+        staleClient.removeAllListeners?.();
+        await staleClient.close();
+      } catch {
+        // ignore — page reload often closes the websocket
+      }
+    }
+
+    await new Promise((r) => setTimeout(r, 500));
+    await updateCDPTargets(electronProcess);
+    return toPublicProcess(electronProcess);
   }
 
   logger.info(`Reloading process ${id} (${appPath})...`);
-  
   stopElectronApp(id);
-  
-  // Aguarda um momento para garantir que a porta foi liberada
   await new Promise(resolve => setTimeout(resolve, 1500));
-  
   logger.info(`Restarting process for ${appPath}...`);
   return startElectronApp(appPath, { debugPort, reconnect });
 }
@@ -342,9 +400,10 @@ export async function manageApp(params: {
   appPath?: string;
   port?: number;
   appId?: string;
+  targetId?: string;
   reconnect?: boolean;
 }): Promise<ElectronProcess | boolean> {
-  const { action, appPath, port, appId, reconnect } = params;
+  const { action, appPath, port, appId, targetId, reconnect } = params;
 
   switch (action) {
     case 'start':
@@ -358,10 +417,35 @@ export async function manageApp(params: {
       return stopElectronApp(appId);
     case 'reload':
       if (!appId) throw new Error('appId is required for reload action.');
-      return reloadElectronApp(appId);
+      return reloadElectronApp(appId, targetId);
     default:
       throw new Error(`Invalid action: ${action}`);
   }
+}
+
+async function listNetworkDebugEndpoints(): Promise<
+  Array<{ port: number; profile?: string; pageTargets: number; active: boolean }>
+> {
+  const portMap = new Map<number, string | undefined>();
+
+  for (const { port, profile } of await discoverPortsFromDevToolsActivePort()) {
+    portMap.set(port, profile);
+  }
+  for (const port of await scanForElectronApps()) {
+    if (!portMap.has(port)) portMap.set(port, undefined);
+  }
+
+  const endpoints: Array<{ port: number; profile?: string; pageTargets: number; active: boolean }> = [];
+  for (const [port, profile] of portMap) {
+    const active = await isDebugPortActive(port);
+    let pageTargets = 0;
+    if (active) {
+      const targets = await fetchCDPTargets(port);
+      pageTargets = targets.filter((t) => t.type === 'page').length;
+    }
+    endpoints.push({ port, profile, pageTargets, active });
+  }
+  return endpoints.sort((a, b) => a.port - b.port);
 }
 
 /**
@@ -371,19 +455,28 @@ export async function manageApp(params: {
  */
 export async function discoverApps(
   params: { scope?: 'managed' | 'network' | 'all' } = {}
-): Promise<{ managed: ElectronProcess[]; network: number[] }> {
+): Promise<{
+  managed: ElectronProcess[];
+  network: number[];
+  endpoints?: Array<{ port: number; profile?: string; pageTargets: number; active: boolean }>;
+}> {
   const { scope = 'all' } = params;
-  const result: { managed: ElectronProcess[]; network: number[] } = {
+  const result: {
+    managed: ElectronProcess[];
+    network: number[];
+    endpoints?: Array<{ port: number; profile?: string; pageTargets: number; active: boolean }>;
+  } = {
     managed: [],
     network: [],
   };
 
   if (scope === 'managed' || scope === 'all') {
-    result.managed = Array.from(electronProcesses.values());
+    result.managed = Array.from(electronProcesses.values()).map(toPublicProcess);
   }
 
   if (scope === 'network' || scope === 'all') {
-    result.network = await scanForElectronApps();
+    result.endpoints = await listNetworkDebugEndpoints();
+    result.network = result.endpoints.filter((e) => e.active).map((e) => e.port);
   }
 
   return result;
